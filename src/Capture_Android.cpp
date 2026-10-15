@@ -26,6 +26,7 @@
 #include <android/log.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -56,6 +57,8 @@ namespace
       ACaptureRequest*                 pRequest   = nullptr;
       ACameraCaptureSession*           pSession   = nullptr;
       std::string                      sId;
+      int                              nIndex     = -1;
+      std::atomic<bool>                bDead      { false };
       int                              nWidth     = 1280;
       int                              nHeight    = 960;
       std::mutex                       mxFrame;
@@ -302,51 +305,81 @@ namespace
       });
    }
 
+   // One acquire per callback, then give the buffer back before the slow
+   // convert. acquireLatestImage, or a second thread acquiring too, stops the
+   // device after a single frame.
+   bool PullImage (DEVICE* pDevice, AImageReader* pReader)
+   {
+      bool bResult = false;
+      AImage* pImage = nullptr;
+
+      if (!pDevice  ||  !pReader  ||  pDevice->bDead.load ())
+         return bResult;
+      if (AImageReader_acquireNextImage (pReader, &pImage) != AMEDIA_OK  ||  !pImage)
+         return bResult;
+
+      int32_t nWidth = 0, nHeight = 0;
+      AImage_getWidth  (pImage, &nWidth);
+      AImage_getHeight (pImage, &nHeight);
+
+      uint8_t* pY = nullptr;
+      uint8_t* pU = nullptr;
+      uint8_t* pV = nullptr;
+      int nLenY = 0, nLenU = 0, nLenV = 0;
+      int nStrideY = 0, nStrideU = 0, nStrideV = 0;
+      int nPixelU = 1, nPixelV = 1;
+      AImage_getPlaneData           (pImage, 0, &pY, &nLenY);
+      AImage_getPlaneData           (pImage, 1, &pU, &nLenU);
+      AImage_getPlaneData           (pImage, 2, &pV, &nLenV);
+      AImage_getPlaneRowStride      (pImage, 0, &nStrideY);
+      AImage_getPlaneRowStride      (pImage, 1, &nStrideU);
+      AImage_getPlaneRowStride      (pImage, 2, &nStrideV);
+      AImage_getPlanePixelStride    (pImage, 1, &nPixelU);
+      AImage_getPlanePixelStride    (pImage, 2, &nPixelV);
+
+      std::vector<uint8_t> aY;
+      std::vector<uint8_t> aU;
+      std::vector<uint8_t> aV;
+      if (pY  &&  pU  &&  pV  &&  nLenY > 0  &&  nLenU > 0  &&  nLenV > 0  &&  nWidth > 1  &&  nHeight > 1)
+      {
+         aY.assign (pY, pY + nLenY);
+         aU.assign (pU, pU + nLenU);
+         aV.assign (pV, pV + nLenV);
+      }
+      AImage_delete (pImage);
+
+      std::vector<uint8_t> aRgba;
+      if (!aY.empty ()  &&  !aU.empty ()  &&  !aV.empty ())
+         CAPTURE_CONVERT::Yuv420 (aY.data (), nStrideY, aU.data (), nStrideU, nPixelU, aV.data (), nStrideV, nPixelV, nWidth, nHeight, aRgba);
+
+      if (!aRgba.empty ())
+      {
+         std::lock_guard<std::mutex> lock (pDevice->mxFrame);
+         if (CAPTURE_PINHOLE::Valid (pDevice->Intrinsics)  &&  (nWidth != pDevice->Intrinsics.nWidth  ||  nHeight != pDevice->Intrinsics.nHeight))
+            CAPTURE_PINHOLE::Scale (pDevice->Intrinsics, pDevice->Intrinsics.nWidth, pDevice->Intrinsics.nHeight, nWidth, nHeight);
+         pDevice->nWidth  = nWidth;
+         pDevice->nHeight = nHeight;
+         pDevice->aRgba.swap (aRgba);
+         pDevice->nFrameIx++;
+         if ((pDevice->nFrameIx % 30ull) == 1ull)
+            __android_log_print (ANDROID_LOG_INFO, "CAPTURE", "frame %llu %dx%d", static_cast<unsigned long long> (pDevice->nFrameIx), nWidth, nHeight);
+         bResult = true;
+      }
+
+      return bResult;
+   }
+
    void OnImage (void* pContext, AImageReader* pReader)
    {
-      DEVICE* pDevice = static_cast<DEVICE*> (pContext);
-      AImage* pImage  = nullptr;
-      if (pDevice  &&  AImageReader_acquireLatestImage (pReader, &pImage) == AMEDIA_OK  &&  pImage)
-      {
-         int32_t nWidth = 0, nHeight = 0;
-         AImage_getWidth  (pImage, &nWidth);
-         AImage_getHeight (pImage, &nHeight);
-
-         uint8_t* pY = nullptr;
-         uint8_t* pU = nullptr;
-         uint8_t* pV = nullptr;
-         int nLenY = 0, nLenU = 0, nLenV = 0;
-         int nStrideY = 0, nStrideU = 0, nStrideV = 0;
-         int nPixelU = 1, nPixelV = 1;
-         AImage_getPlaneData           (pImage, 0, &pY, &nLenY);
-         AImage_getPlaneData           (pImage, 1, &pU, &nLenU);
-         AImage_getPlaneData           (pImage, 2, &pV, &nLenV);
-         AImage_getPlaneRowStride      (pImage, 0, &nStrideY);
-         AImage_getPlaneRowStride      (pImage, 1, &nStrideU);
-         AImage_getPlaneRowStride      (pImage, 2, &nStrideV);
-         AImage_getPlanePixelStride    (pImage, 1, &nPixelU);
-         AImage_getPlanePixelStride    (pImage, 2, &nPixelV);
-
-         std::vector<uint8_t> aRgba;
-         CAPTURE_CONVERT::Yuv420 (pY, nStrideY, pU, nStrideU, nPixelU, pV, nStrideV, nPixelV, nWidth, nHeight, aRgba);
-         AImage_delete (pImage);
-
-         if (!aRgba.empty ())
-         {
-            std::lock_guard<std::mutex> lock (pDevice->mxFrame);
-            if (CAPTURE_PINHOLE::Valid (pDevice->Intrinsics)  &&  (nWidth != pDevice->Intrinsics.nWidth  ||  nHeight != pDevice->Intrinsics.nHeight))
-               CAPTURE_PINHOLE::Scale (pDevice->Intrinsics, pDevice->Intrinsics.nWidth, pDevice->Intrinsics.nHeight, nWidth, nHeight);
-            pDevice->nWidth  = nWidth;
-            pDevice->nHeight = nHeight;
-            pDevice->aRgba.swap (aRgba);
-            pDevice->nFrameIx++;
-         }
-      }
+      PullImage (static_cast<DEVICE*> (pContext), pReader);
    }
 
    void OnDisconnected (void*, ACameraDevice*) {}
-   void OnError (void*, ACameraDevice*, int nError)
+   void OnError (void* pContext, ACameraDevice*, int nError)
    {
+      auto* pDevice = static_cast<DEVICE*> (pContext);
+      if (pDevice)
+         pDevice->bDead.store (true);
       __android_log_print (ANDROID_LOG_WARN, "CAPTURE", "camera device error %d", nError);
    }
    void OnSessionClosed (void*, ACameraCaptureSession*) {}
@@ -389,6 +422,7 @@ namespace
       {
          DEVICE* pDevice = new DEVICE ();
          pDevice->sId      = aCam[nIndex].sId;
+         pDevice->nIndex   = nIndex;
          pDevice->pManager = s_pManager;
          PickSize (s_pManager, pDevice->sId.c_str (), pDevice->nWidth, pDevice->nHeight);
          FillPinhole (s_pManager, pDevice->sId.c_str (), pDevice->nWidth, pDevice->nHeight, pDevice->Intrinsics);
@@ -506,7 +540,11 @@ namespace
          }
 
          // Image callbacks are posted to this looper. pollOnce runs them.
-         ALooper_pollOnce (16, nullptr, nullptr, nullptr);
+         // Drain every pending callback before sleeping again so a slow convert
+         // cannot leave the reader full.
+         int nPoll = ALooper_pollOnce (8, nullptr, nullptr, nullptr);
+         while (nPoll == ALOOPER_POLL_CALLBACK)
+            nPoll = ALooper_pollOnce (0, nullptr, nullptr, nullptr);
       }
 
       std::vector<DEVICE*> aDevice;
@@ -625,7 +663,7 @@ bool CAPTURE_PLATFORM::Latest (uint32_t nHandle, FRAME& Frame)
       if (it != s_umpDevice.end ())
          pDevice = it->second;
    }
-   if (pDevice)
+   if (pDevice  &&  !pDevice->bDead.load ())
    {
       std::lock_guard<std::mutex> lock (pDevice->mxFrame);
       if (!pDevice->aRgba.empty ())
